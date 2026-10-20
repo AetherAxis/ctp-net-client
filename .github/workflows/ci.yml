@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 本仓 checkout 到仓名目录（跨仓 ProjectReference 解析到同级 <dep>/ 目录）
+      - uses: actions/checkout@v4
+        with:
+          path: ctp-net-client
+      # 跨仓依赖（本地 ProjectReference 拓扑——切 PackageReference 后可移除）
+      - uses: actions/checkout@v4
+        with:
+          repository: AetherAxis/ctp-net-contracts
+          path: ctp-net-contracts
+      - uses: actions/checkout@v4
+        with:
+          repository: AetherAxis/ctp-net-core
+          path: ctp-net-core
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # GitHub Packages 私有源凭据（GITHUB_TOKEN 只写进 CI 运行时文件，不入库）。
+      # 依赖仓为私有仓时 GITHUB_TOKEN 默认不能跨仓读取——需在 org Settings → Actions →
+      # General 开放 accessible repositories，或改用 PAT secret。
+      - name: Configure GitHub Packages credentials
+        run: >
+          dotnet nuget update source github
+          --configfile ctp-net-client/nuget.config
+          --username AetherAxis
+          --password ${{ secrets.GITHUB_TOKEN }}
+          --store-password-in-clear-text
+
+      - name: Build
+        run: dotnet build ctp-net-client.slnx -c Release
+        working-directory: ctp-net-client
