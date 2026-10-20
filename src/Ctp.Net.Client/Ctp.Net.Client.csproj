@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 客户端侧 CTP SDK 封装（官方 SDK 链路）：CtpSessionService 实现 Ctp.Net.ICtpSession（契约仓正典）。
+       与 ctp-net-front（服务端前置）分属两仓：front 是「被连的一方」（线协议服务器），
+       本仓是「去连的一方」（客户端 SDK → ICtpSession 端口）。 -->
+  <ItemGroup>
+    <!-- Ctp.Net 契约（ICtpSession + DTO + 异常 + 交易时段表 + 连接档案契约） -->
+    <ProjectReference Include="..\..\..\ctp-net-contracts\src\Ctp.Net.Contracts\Ctp.Net.Contracts.csproj" />
+    <!-- 官方 CTP SDK wrapper（CtpTrader / CtpMarketData，P/Invoke 原生库经 Content 随链复制） -->
+    <ProjectReference Include="..\..\..\ctp-net-core\src\Ctp.Net.Core\Ctp.Net.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
