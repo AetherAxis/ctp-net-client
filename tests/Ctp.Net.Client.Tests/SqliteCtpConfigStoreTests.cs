@@ -7,6 +7,19 @@ namespace Ctp.Net.Client.Tests;
 public class SqliteCtpConfigStoreTests
 {
     [Fact]
+    public async Task 凭据库文件权限为0600_同机其它用户不可读()
+    {
+        if (OperatingSystem.IsWindows()) return;   // 权限位是 POSIX 语义（Windows 走目录 ACL）
+        await using var store = await CreateAsync();
+        await store.SaveAsync(NewProfile(userId: "600", front: "sim", name: "600"));
+
+        // README 承诺的 chmod 600 必须由代码兑现——表里是明文口令/授权码
+        Assert.Equal(
+            UnixFileMode.UserRead | UnixFileMode.UserWrite,
+            File.GetUnixFileMode(store.Path));
+    }
+
+    [Fact]
     public async Task GetAll_returns_empty_on_fresh_db()
     {
         await using var store = await CreateAsync();

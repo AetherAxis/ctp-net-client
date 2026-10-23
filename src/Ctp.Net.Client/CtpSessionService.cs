@@ -44,7 +44,7 @@ public class CtpSessionService : ICtpSession, IDisposable
     private readonly SemaphoreSlim _reconnectLock = new(1, 1);
     private Timer? _safetyTimer;
     private volatile bool _reconnecting;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     private sealed record MdCreds(string Front, string BrokerId, string UserId, string Password);
 
@@ -62,6 +62,11 @@ public class CtpSessionService : ICtpSession, IDisposable
     public string? BrokerId => _brokerId;
 
     public string? UserId => _userId;
+
+    /// <summary>诊断日志出口（默认 stderr——保持原有可见性；宿主可替换成自己的 logger/日志窗）。
+    /// 不引 <c>Microsoft.Extensions.Logging.Abstractions</c>：本仓是 native 封装库，日志只有这几行，
+    /// 一个 sink 足够，也免掉给 <c>nuget.config</c> 的 source mapping 加一条（同 CtpLeanGateway.LogSink 做法）。</summary>
+    public Action<string> LogSink { get; set; } = m => Console.Error.WriteLine(m);
 
     // —— 事件：领域 DTO 类型（Application 层订阅；本程序集 AI 工具不订阅事件）——
     public event EventHandler<CtpOrder>? OrderReceived;
@@ -436,15 +441,27 @@ public class CtpSessionService : ICtpSession, IDisposable
     private void OnMdFrontConnected(object? sender, EventArgs e)
     {
         if (!_mdHadSubscribed || _mdSocketAlive) return;
-        var creds = _cachedMdCreds;
-        var symbols = _cachedSymbols;
-        if (creds == null || symbols.Count == 0) return;
+        // 快照：_cachedSymbols 会被 SubscribeMarketDataAsync/UnsubscribeMarketData 在锁内改（AddRange/Clear），
+        // 直接把 List 交给后台任务 = 边遍历边被改（InvalidOperationException/读到撕裂序列）。
+        MdCreds? creds;
+        string[] symbols;
+        lock (_lock)
+        {
+            creds = _cachedMdCreds;
+            symbols = _cachedSymbols.ToArray();
+        }
+        if (creds == null || symbols.Length == 0) return;
         _ = Task.Run(() => ReconnectMdAsync(creds, symbols));
     }
 
     /// <summary>安全定时器：30s 巡检。盘中失活 → 强制重建重登（兜底 SDK 放弃重连）；闭市 → 维持 Closed。</summary>
-    // E2 形态边界规避阈值（2026-10-15）：SDK 的查询族链路计数第 256 个起换编码形态，本地前置应答
-    // 无法满足客户端校验——计数达 220（36 余量）即主动重连交易腿（计数清零）。行情腿保留不动 ⇒
+    /// <remarks>
+    /// <b>未实现（原注释曾称已实现，属注释漂移——2026-10-24 校正）</b>：E2 形态边界规避阈值
+    /// （2026-10-15 观察：SDK 查询族链路计数第 256 个起换编码形态，本地前置应答无法满足客户端校验 ⇒
+    /// 设想「计数达 220 即主动重连交易腿」）。本服务没有该计数逻辑：计数发生在 SDK 内部链路，
+    /// 且前置适配层的查询也走同一链路，本类数不到真实数字——**不在本层臆造一个代理计数**（会掩盖而非修复）。
+    /// 真要落地须在 E2 前置侧验证后，以 SDK/前置的确定语义实现。
+    /// </remarks>
     private void OnSafetyTimer(object? state)
     {
         if (!_hadLoggedIn || _socketAlive || _reconnecting) return;
@@ -470,6 +487,7 @@ public class CtpSessionService : ICtpSession, IDisposable
     /// </summary>
     private async Task ReconnectAsync()
     {
+        if (_disposed) return;   // 已释放：不再起新连接（Dispose 后到达的 FrontConnected 回调）
         if (!await _reconnectLock.WaitAsync(0)) return; // 已有重连在进行，跳过
         _reconnecting = true;
         SetStatus(CtpConnectionStatus.Reconnecting);
@@ -508,10 +526,16 @@ public class CtpSessionService : ICtpSession, IDisposable
             }
             SetStatus(CtpConnectionStatus.Connected);
 
-            // 重新订阅行情（若有缓存）
-            var md = _cachedMdCreds;
-            if (md != null && _cachedSymbols.Count > 0)
-                _ = ReconnectMdAsync(md, _cachedSymbols);
+            // 重新订阅行情（若有缓存）——同样取快照（_cachedSymbols 在锁内会被改）
+            MdCreds? md;
+            string[] symbols;
+            lock (_lock)
+            {
+                md = _cachedMdCreds;
+                symbols = _cachedSymbols.ToArray();
+            }
+            if (md != null && symbols.Length > 0)
+                _ = ReconnectMdAsync(md, symbols);
         }
         catch
         {
@@ -524,7 +548,9 @@ public class CtpSessionService : ICtpSession, IDisposable
         finally
         {
             _reconnecting = false;
-            _reconnectLock.Release();
+            // 不 Release 已释放的信号量（Dispose 与在飞重连的竞态——旧代码在 in-flight 的 Release 之前
+            // 就 Dispose，Release 抛 ObjectDisposedException 落在后台任务上无人接）。见 Dispose。
+            if (!_disposed) _reconnectLock.Release();
         }
     }
 
@@ -534,7 +560,7 @@ public class CtpSessionService : ICtpSession, IDisposable
         // 重入守卫（2026-10-19 md 重连风暴根因）：LoginAsync 期间新连接的 FrontConnected 同样满足
         // OnMdFrontConnected 的 `!_mdSocketAlive` 条件 ⇒ 立即重入本方法 ⇒ 开头 Dispose 刚登录的连接
         // ⇒ 前置侧表现为「md 登录成功后立即断开」的每秒数十次风暴（F0 回收断交易腿触发首轮后自持）。
-        if (_mdReconnecting) return;
+        if (_disposed || _mdReconnecting) return;
         _mdReconnecting = true;
         try
         {
@@ -563,8 +589,9 @@ public class CtpSessionService : ICtpSession, IDisposable
         {
             // 订阅失败：退避重试（受控递归，替代事件风暴）。旧版吞异常——md 静默死且第一推动力不可见。
             _mdSocketAlive = false;
-            Console.Error.WriteLine($"[CtpSession] MD 重连/重订阅失败（5s 后重试）: {ex.Message}");
+            Log($"[CtpSession] MD 重连/重订阅失败（5s 后重试）: {ex.Message}");
             await Task.Delay(TimeSpan.FromSeconds(5));
+            if (_disposed) return;   // 退避期间宿主已释放——不再排重试（否则释放后仍在起连接）
             _ = Task.Run(() => ReconnectMdAsync(creds, symbols));
         }
         finally { _mdReconnecting = false; }
@@ -577,12 +604,20 @@ public class CtpSessionService : ICtpSession, IDisposable
         ConnectionStateChanged?.Invoke(this, newStatus);
     }
 
+    private void Log(string message)
+    {
+        try { LogSink(message); } catch { /* 宿主的日志出口炸了不能反过来炸会话 */ }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         StopSafetyTimer();
         Logout();
-        _reconnectLock.Dispose();
+        // 不 Dispose _reconnectLock：SemaphoreSlim 无等待句柄时没有非托管资源，而 Dispose 与在飞
+        // ReconnectAsync 的 Release 是竞态——释放后 Release/WaitAsync 抛 ObjectDisposedException，
+        // 且那行在后台任务的 finally 里，异常无人接（会变成 UnobservedTaskException）。
+        // 释放语义由 _disposed 守卫（ReconnectAsync/ReconnectMdAsync 入口 + 退避后）承担。
     }
 }

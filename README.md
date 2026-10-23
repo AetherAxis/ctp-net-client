@@ -31,7 +31,7 @@ services.AddCtpInfrastructure();   // ICtpSession + ICtpConfigStore 注册
 ## 构建与测试
 
 ```bash
-dotnet test ctp-net-client.slnx    # tests/Ctp.Net.Client.Tests：24 例（会话注册 DI / SimFront 地址判据 / SQLite 凭据仓）——纯逻辑零 native SDK，CI 可全量跑
+dotnet test ctp-net-client.slnx    # tests/Ctp.Net.Client.Tests：25 例（会话注册 DI / SimFront 地址判据 / SQLite 凭据仓含 0600 权限）——纯逻辑零 native SDK，CI 可全量跑
 ```
 
 ## 来历

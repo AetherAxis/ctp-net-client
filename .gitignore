@@ -7,3 +7,8 @@ obj/
 
 # macOS
 .DS_Store
+
+# 测试产物（dotnet test --collect:"XPlat Code Coverage" 落的覆盖率与 TestResults）
+TestResults/
+*.cobertura.xml
+coverage.*.xml

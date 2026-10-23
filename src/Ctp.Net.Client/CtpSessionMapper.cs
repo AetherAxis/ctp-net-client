@@ -39,6 +39,7 @@ internal static class CtpSessionMapper
         HedgeFlag = (CtpHedgeFlag)p.HedgeFlag,
         PositionDate = (CtpPositionDate)p.PositionDate,
         YdPosition = p.YdPosition, TotalPosition = p.TotalPosition, TodayPosition = p.TodayPosition,
+        PositionCost = p.PositionCost,
         UseMargin = p.UseMargin, PositionProfit = p.PositionProfit, CloseProfit = p.CloseProfit,
     };
 

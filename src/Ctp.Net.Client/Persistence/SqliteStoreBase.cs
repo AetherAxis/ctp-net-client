@@ -77,6 +77,7 @@ public abstract class SqliteStoreBase
             if (_initialized != 0) return;   // 双检：并发调用者拿到锁时首个已完成
             EnsureDirectory();
             await using var c = await OpenAsync(ct).ConfigureAwait(false);
+            RestrictDatabaseFilePermissions();   // 文件此刻才存在（SQLite 懒创建）
             await using (var wal = c.CreateCommand())
             {
                 wal.CommandText = "PRAGMA journal_mode=WAL;";
@@ -105,6 +106,7 @@ public abstract class SqliteStoreBase
             if (_initialized != 0) return;
             EnsureDirectory();
             using var c = Open();
+            RestrictDatabaseFilePermissions();   // 文件此刻才存在（SQLite 懒创建）
             using (var wal = c.CreateCommand())
             {
                 wal.CommandText = "PRAGMA journal_mode=WAL;";
@@ -127,6 +129,26 @@ public abstract class SqliteStoreBase
 
     /// <summary>Override to run idempotent column migrations after schema creation (sync path).</summary>
     protected virtual void Migrate(SqliteConnection connection) { }
+
+    /// <summary>
+    /// 凭据文件收权限到 0600（POSIX）。本类承载的表里有多处明文口令/授权码（如 <c>ctp_profile.password</c>），
+    /// 默认 umask 022 建出来的文件同机任何用户可读——<c>README</c> 承诺的「chmod 600」必须由代码兑现，
+    /// 不能指望部署方记得手工做。SQLite 用 DB 文件自身的 mode 创建 <c>-wal</c>/<c>-shm</c>，所以收 DB 文件即可。
+    /// Windows 走用户目录 ACL，不做处理。
+    /// </summary>
+    protected void RestrictDatabaseFilePermissions()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var dbPath = ExtractDataSourcePath(ConnectionString);
+        if (string.IsNullOrEmpty(dbPath)) return;
+        try
+        {
+            if (File.Exists(dbPath))
+                File.SetUnixFileMode(dbPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        catch (IOException) { /* 只读介质/并发占用：权限收不上不是致命错，别让存取失败 */ }
+        catch (UnauthorizedAccessException) { }
+    }
 
     private void EnsureDirectory()
     {
