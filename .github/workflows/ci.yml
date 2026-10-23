@@ -45,3 +45,8 @@ jobs:
       - name: Build
         run: dotnet build ctp-net-client.slnx -c Release
         working-directory: ctp-net-client
+
+      # 2026-10-23 迁入测试：24 例 = 会话注册 / SimFront 判据 / SQLite 凭据仓（纯逻辑，无 native SDK）。
+      - name: Test
+        run: dotnet test ctp-net-client.slnx -c Release --no-build
+        working-directory: ctp-net-client

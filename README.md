@@ -28,6 +28,12 @@ services.AddCtpInfrastructure();   // ICtpSession + ICtpConfigStore 注册
 
 会话连接参数（前置地址/凭据）经 `ICtpConfigStore` 档案或调用方注入——本地仿真柜台填 `tcp://127.0.0.1:17801`（交易）/ `tcp://127.0.0.1:17802`（行情），真实前置（SimNow 等）同一链路。
 
+## 构建与测试
+
+```bash
+dotnet test ctp-net-client.slnx    # tests/Ctp.Net.Client.Tests：24 例（会话注册 DI / SimFront 地址判据 / SQLite 凭据仓）——纯逻辑零 native SDK，CI 可全量跑
+```
+
 ## 来历
 
 2026-10-20 拆自 Aether monorepo `business/Ctp/Acme.Ctp.Infrastructure/`（初名 `Acme.Ctp.Infrastructure`，同日命名统一 `Ctp.Net.Client`）。完整决策记录见工作区根 `MIGRATION.md`。
