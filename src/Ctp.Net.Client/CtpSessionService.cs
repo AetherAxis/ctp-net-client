@@ -206,10 +206,10 @@ public class CtpSessionService : ICtpSession, IDisposable
         return await trader.OrderInsertAsync(request);
     }
 
-    public async Task OrderActionAsync(string brokerId, string investorId, int frontId, int sessionId, string orderRef, string exchangeId)
+    public async Task OrderActionAsync(string brokerId, string investorId, int frontId, int sessionId, string orderRef, string exchangeId, string? instrumentId = null)
     {
         var trader = GetTrader();
-        await trader.OrderActionAsync(brokerId, investorId, frontId, sessionId, orderRef, exchangeId);
+        await trader.OrderActionAsync(brokerId, investorId, frontId, sessionId, orderRef, exchangeId, instrumentId);
     }
 
     public async Task<IReadOnlyList<Order>> QueryOrderAsync(string brokerId, string investorId, string? instrumentId = null)
@@ -351,7 +351,7 @@ public class CtpSessionService : ICtpSession, IDisposable
     async Task ICtpSession.OrderActionAsync(CtpOrderRef orderRef, CancellationToken ct)
     {
         await OrderActionAsync(orderRef.BrokerId, orderRef.InvestorId,
-            orderRef.FrontId, orderRef.SessionId, orderRef.OrderRef, orderRef.ExchangeId);
+            orderRef.FrontId, orderRef.SessionId, orderRef.OrderRef, orderRef.ExchangeId, orderRef.InstrumentId);
     }
 
     async Task ICtpSession.SubscribeMarketDataAsync(CtpMarketDataConnect connect, IReadOnlyList<string> symbols, CancellationToken ct)
