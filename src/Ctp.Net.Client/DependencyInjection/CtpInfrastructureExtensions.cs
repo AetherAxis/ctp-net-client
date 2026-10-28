@@ -11,7 +11,7 @@ namespace Ctp.Net.Client.DependencyInjection;
 /// <para>
 /// <b>一律官方 SDK 链路</b>（2026-10-01 起）：<see cref="ICtpSession"/> 直连 <see cref="CtpSessionService"/>——
 /// 本地仿真柜台填前置 <c>tcp://127.0.0.1:17801</c>（交易）/ <c>tcp://127.0.0.1:17802</c>（行情，host 进程
-/// <c>dotnet run --project aether-apps/Aether.Exchange.Host</c>）；真实前置（SimNow 等）同一链路。
+/// <c>dotnet run --project aether-ctp-hosts/Aether.Exchange.Host</c>）；真实前置（SimNow 等）同一链路。
 /// 旧 <c>sim</c> 关键字 JSON-RPC 直连已退役（2026-10-04 死代码清理：<c>RoutingCtpSession</c> 删除；
 /// <c>RemoteCtpSession</c> 迁至 <c>Aether.Exchange.Rpc</c> 归属仿真侧——客户端上下文自此零引用服务端项目）。
 /// </para>
