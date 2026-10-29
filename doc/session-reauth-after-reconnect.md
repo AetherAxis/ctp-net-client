@@ -3,6 +3,7 @@
 > 状态：**未修复**（根因仍在）。临时处置：2026-10-29 起两个 bot 改走**直连交易所的旁路客户端**，绕开被强制断连的前置交易腿 —— 见 `../../aether-ctp-hosts/doc/direct-bot-bypass.md`，前置修好后该客户端整体退役。
 > 归属：本仓 `CtpSessionService`（会话状态机）+ `ctp-net-core/CtpTrader`（认证原语）；诱因在 `ctp-net-front`（F0 序号 240 强制断连）。
 > 同批困难点汇总见 `../../aether-ctp-hosts/doc/two-bots-live-market.md`；行情投递契约见 `../../ctp-net-front/doc/md-tick-delivery.md`。
+> **怎么修、以及整条 CTP 线接下来该做什么**：`session-lifecycle.md`（会话语义、状态机 + epoch、在途对账、240 断连的消除路径、待实测清单）。
 
 ## 1. 现象
 
