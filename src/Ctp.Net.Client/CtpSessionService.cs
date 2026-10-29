@@ -237,6 +237,7 @@ public class CtpSessionService : ICtpSession, IDisposable
                 // 未连接或账户变：重建连接 + 订阅
                 if (_md != null)
                 {
+                    _md.TickReceived -= OnTickReceived;
                     _md.FrontConnected -= OnMdFrontConnected;
                     _md.FrontDisconnected -= OnMdFrontDisconnected;
                     _md.Dispose();
@@ -277,6 +278,7 @@ public class CtpSessionService : ICtpSession, IDisposable
         {
             if (_md != null)
             {
+                _md.TickReceived -= OnTickReceived;
                 _md.FrontConnected -= OnMdFrontConnected;
                 _md.FrontDisconnected -= OnMdFrontDisconnected;
                 _md.Dispose();
@@ -501,6 +503,11 @@ public class CtpSessionService : ICtpSession, IDisposable
             {
                 if (_trader != null)
                 {
+                    // 事件订阅必须显式摘除：CtpTrader/CtpMarketData 是进程外句柄的托管壳，Dispose 只释放原生
+                    // 句柄，挂在上面的托管委托仍指向本会话——旧实例一旦还有回调进来就会重复投递到同一个下游
+                    // （2026-10-29 双 bot 事故复核：MD 重建路径只摘了 FrontConnected/Disconnected）。
+                    try { _trader.OrderReceived -= OnOrderReceived; } catch { }
+                    try { _trader.TradeReceived -= OnTradeReceived; } catch { }
                     try { _trader.FrontConnected -= OnTraderFrontConnected; } catch { }
                     try { _trader.FrontDisconnected -= OnTraderFrontDisconnected; } catch { }
                     _trader.Dispose();
@@ -568,6 +575,7 @@ public class CtpSessionService : ICtpSession, IDisposable
             {
                 if (_md != null)
                 {
+                    try { _md.TickReceived -= OnTickReceived; } catch { }
                     try { _md.FrontConnected -= OnMdFrontConnected; } catch { }
                     try { _md.FrontDisconnected -= OnMdFrontDisconnected; } catch { }
                     _md.Dispose();
