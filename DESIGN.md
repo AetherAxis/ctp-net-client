@@ -101,3 +101,56 @@
 
 仍缺（与本轮无关、已被文档钉住）：`FrontConnected` 仍以 `_socketAlive` 为闸（§6 之外，见 `doc/session-lifecycle.md` §11）、
 会话日志未恢复、240 断连未挪安全点。
+
+## 9. 本轮升级落地（2026-10-30）：状态机行为测试（§6 #2）
+
+**问题**：#2 一直卡在「测状态迁移就得构造 `CtpSessionService`，而它构造即加载 `ctp_native`」——
+于是「断线窗口里状态落在哪」这个**直接决定要不要发单**的判断，一条用例都没有。
+
+**做法**：把迁移抽成纯函数 `src/Ctp.Net.Client/CtpSessionStateMachine.cs`
+（`CtpSessionEvent` 三事件 + `Next/AllowsWrite/StartsNewEpoch`），并把服务里**全部 4 处** `_state` 赋值
+换成走 `Next`（`EnterReady` / `LeaveReady` / `Dispose` / `ReconnectAsync`），`RequireReady` 的判据换成
+`AllowsWrite`。测试覆盖的就是线上那份逻辑，不是平行实现。
+
+新增 `tests/Ctp.Net.Client.Tests/CtpSessionStateMachineTests.cs`（20 例）：12 行迁移矩阵 +
+三条不变量（只有登录成功能进 Ready / 连接丢了绝不停在 Ready / 只有 Ready 可写）+ 幂等与反复断线重登 +
+纪元语义 + 未知事件抛异常。客户端测试总数 24 → 45，全绿。
+
+**一处刻意的行为变更**：`Disconnected`（从未登录过）收到 `SocketLost` 现在**留在 Disconnected**，
+不再因为「会自动重连」而宣称 Connecting。理由：枚举注释里 Connecting 的定义是「**曾登录过**，
+正在重连 + 重登」，启动时前置还没起来的抖动不构成可恢复的会话。两种状态都禁止写操作，对交易零影响。
+
+**仍未做**：#2 的另一半「native 壳内部的行为测试」依然不可能（没有接缝）——但那部分由
+`ctp-net-front` 的 loopback E2E 用真 SDK 覆盖；`FrontConnected` 闸门（§11）与 240 安全点仍按原计划列在 front 仓。
+
+## 10. 本轮升级落地（2026-10-30）：#3 FrontConnected 门控 + #13 OrderRef 本地高水位
+
+### #3 `FrontConnected` 不再以 `_socketAlive` 为闸
+
+**问题（2026-10-29 事故）**：`OnTraderFrontConnected` 的门控是 `_hadLoggedIn && !_socketAlive`，
+它成立的前提是「**先**收到 `FrontDisconnected`」。SDK 在某些时序下（服务端主动 Close）只回调
+`FrontConnected` ⇒ `_socketAlive` 仍为真 ⇒ 重连不触发 ⇒ 新连接从不发认证帧 ⇒ 之后的报单全被
+柜台当垃圾帧丢弃。当时没敢动，是因为「没有客户端侧证据，改错方向就是重连风暴」。
+
+**做法**：门控事实换成「**这条 trader 实例自己登过没有**」（`_traderLoggedIn`，volatile）：
+只要它登过又收到 `FrontConnected`，就一定是掉线重连，必须重建 + 重登。
+重连风暴不需要靠门控防——`ReconnectAsync` 内部 `_reconnectLock.WaitAsync(0)` 单飞；
+新实例在它自己 `LoginAsync` 期间收到的 `FrontConnected` 因为 `_traderLoggedIn=false` 不会自触发。
+顺带把「状态漂移」写成一条日志（`FrontConnected` 时 `_socketAlive` 仍为真）——这正是当初缺的证据，
+以后再出现同类事件，bot 侧日志里能直接看到。
+
+### #13 OrderRef 本地高水位
+
+**问题**：`OrderRef` 只由柜台登录应答的 `MaxOrderRef` 决定。柜台会话一换（重启 / 换前置 / 换交易日）
+计数归零 ⇒ 新会话从 1 发号 ⇒ 与前置/交易所里仍挂着的旧单撞号 ⇒ 撤错单。
+
+**做法（分两层，各管一件事）**：
+
+| 层 | 落点 | 说明 |
+|---|---|---|
+| core | `CtpTrader.OrderRefFloor` / `OrderRefHighWater` | 登录时起点 = `max(柜台 MaxOrderRef, OrderRefFloor)`；每发一个号就抬高 `OrderRefHighWater`（**先记账再返回**，发出去的号永不回卷）。core 不碰磁盘。 |
+| client | `IOrderRefHighWaterStore` + `SqliteOrderRefHighWaterStore`（表 `ctp_order_ref`，键 `(broker,user)`） | 登录/重登成功即把持久化水位顶成 `OrderRefFloor`；下单后异步记账（不 await，审计性写入不加下单延迟）。`ON CONFLICT ... max()` 保证**只升不降**。 |
+
+未注册 store 时（老宿主）行为与旧版完全一致——新能力是 opt-in，不是隐式改变下单路径。
+新增测试 7 例（`OrderRefHighWaterStoreTests`）：读空、写读、只升不降、非正数忽略、账户隔离、跨进程重开、并发取最大。
+客户端测试总数 45 → 52。

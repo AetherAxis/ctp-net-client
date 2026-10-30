@@ -32,6 +32,12 @@ public class CtpSessionService : ICtpSession, IDisposable
 
     // —— 断线/重连状态 ——
     private volatile bool _socketAlive;          // 交易 socket 是否存活（断线后 false，重连重登成功 true）
+    // 「**当前 _trader 实例**是否已完成过登录」（2026-10-30，open-issues #3 的修复基础）。
+    // 为什么不能用 _socketAlive 做 FrontConnected 的门控：那个布尔量依赖「先收到 FrontDisconnected」，
+    // 而 SDK 在某些时序下只回调 FrontConnected（服务端主动 Close）⇒ _socketAlive 仍为真 ⇒ 不触发重连
+    // ⇒ 新连接从不发认证帧 ⇒ 之后的报单全被柜台当垃圾丢弃（2026-10-29 事故）。
+    // 换成「这条实例自己登过没有」这个事实：只要它登过又收到 FrontConnected，就一定是掉线重连，必须重登。
+    private volatile bool _traderLoggedIn;
     private volatile bool _hadLoggedIn;          // 是否曾成功登录过（区分首次连接 vs 重连）
     private volatile bool _mdSocketAlive;        // 行情 socket 是否存活
     private volatile bool _mdHadSubscribed;      // 是否曾成功订阅过行情（区分首次连接 vs 重连）
@@ -54,6 +60,15 @@ public class CtpSessionService : ICtpSession, IDisposable
 
     private sealed record MdCreds(string Front, string BrokerId, string UserId, string Password);
 
+    /// <summary>
+    /// OrderRef 本地高水位存储（DESIGN §6 #13）。可为 null = 不持久化（退回「只用柜台 MaxOrderRef」的旧行为）。
+    /// 只在登录/重登成功与下单后各碰一次 SQLite，不在热路径上轮询。
+    /// </summary>
+    private readonly IOrderRefHighWaterStore? _orderRefStore;
+
+    /// <summary>DI 用的构造（<paramref name="orderRefStore"/> 未注册时为 null，行为与旧版一致）。</summary>
+    public CtpSessionService(IOrderRefHighWaterStore? orderRefStore = null) => _orderRefStore = orderRefStore;
+
     /// <summary>socket 存活 && 对象未释放才算已连接（修复"前置关闭后 IsConnected 仍 true"的假状态）。</summary>
     public bool IsConnected => _trader != null && !_trader.IsDisposed && _socketAlive;
 
@@ -75,7 +90,8 @@ public class CtpSessionService : ICtpSession, IDisposable
     {
         lock (_lock)
         {
-            if (_state != CtpSessionState.Ready || _trader is null || _trader.IsDisposed)
+            // 「能不能写」只有 CtpSessionStateMachine.AllowsWrite 一个判据（可测、单点）
+            if (!CtpSessionStateMachine.AllowsWrite(_state) || _trader is null || _trader.IsDisposed)
                 throw new CtpSessionNotReadyException(_state, Epoch, operation);
             return _trader;
         }
@@ -84,8 +100,9 @@ public class CtpSessionService : ICtpSession, IDisposable
     /// <summary>进入 Ready（唯一写入口：登录成功 / 重登成功）。</summary>
     private void EnterReady()
     {
-        Interlocked.Increment(ref _epoch);
-        _state = CtpSessionState.Ready;
+        if (CtpSessionStateMachine.StartsNewEpoch(CtpSessionEvent.LoginSucceeded))
+            Interlocked.Increment(ref _epoch);   // 先动纪元再切状态：调用方读到 Ready 时纪元一定已是新的
+        _state = CtpSessionStateMachine.Next(_state, CtpSessionEvent.LoginSucceeded, autoReconnect: false);
     }
 
     /// <summary>
@@ -93,9 +110,7 @@ public class CtpSessionService : ICtpSession, IDisposable
     /// 闭市/放弃重连 ⇒ <see cref="CtpSessionState.Disconnected"/>。
     /// </summary>
     private void LeaveReady()
-    {
-        _state = ShouldAutoReconnect() ? CtpSessionState.Connecting : CtpSessionState.Disconnected;
-    }
+        => _state = CtpSessionStateMachine.Next(_state, CtpSessionEvent.SocketLost, ShouldAutoReconnect());
 
     public bool IsMdSubscribed => _md != null && !_md.IsDisposed;
 
@@ -165,7 +180,10 @@ public class CtpSessionService : ICtpSession, IDisposable
             _simFront = IsSimFrontAddress(request.FrontAddress);
             _socketAlive = true;
             _hadLoggedIn = true;
+            _traderLoggedIn = true;   // 这条实例登过了——之后它的 FrontConnected 一律视为掉线重连
         }
+
+        await SeedOrderRefFloorAsync(trader, request.BrokerId, request.UserId);
 
         EnterReady();
         StartSafetyTimer();
@@ -219,10 +237,11 @@ public class CtpSessionService : ICtpSession, IDisposable
             _cachedSymbols.Clear();
             _socketAlive = false;
             _hadLoggedIn = false;
+            _traderLoggedIn = false;
             _mdSocketAlive = false;
             _mdHadSubscribed = false;
         }
-        _state = CtpSessionState.Disconnected;
+        _state = CtpSessionStateMachine.Next(_state, CtpSessionEvent.SessionClosed, autoReconnect: false);
         SetStatus(CtpConnectionStatus.Disconnected);
     }
 
@@ -250,7 +269,46 @@ public class CtpSessionService : ICtpSession, IDisposable
     public async Task<OrderInsertResult> OrderInsertAsync(OrderRequest request)
     {
         var trader = GetTrader("报单");   // 断线窗口内直接拒绝：不排队、不静默丢弃
-        return await trader.OrderInsertAsync(request);
+        var result = await trader.OrderInsertAsync(request);
+        // 发出去就记账（只升不降）：下次登录（可能换会话/跨重启）的起点因此不低于本次。
+        // 记账失败只记日志、不影响已发出的单——水位落后最多退回旧行为，不会造成已发号被复用。
+        string? broker, user;
+        lock (_lock) { broker = _brokerId; user = _userId; }   // 与登录时的种子键保持同一来源
+        PersistOrderRefHighWater(trader, broker, user);
+        return result;
+    }
+
+    /// <summary>登录/重登成功后：把持久化的本地高水位顶到 trader 上（≥ 柜台 MaxOrderRef 才生效）。</summary>
+    private async Task SeedOrderRefFloorAsync(CtpTrader trader, string brokerId, string userId)
+    {
+        if (_orderRefStore is null) return;
+        try
+        {
+            var hw = await _orderRefStore.GetAsync(brokerId, userId);
+            if (hw > 0)
+            {
+                trader.OrderRefFloor = hw;
+                Log($"[ctp-client] OrderRef 本地高水位 {hw}（{brokerId}/{userId}）已作为下单起点下限");
+            }
+        }
+        catch (Exception ex)
+        {
+            // 读不到就退回「只用柜台 MaxOrderRef」——不阻断登录
+            Log($"[ctp-client] 读 OrderRef 高水位失败（忽略，退回柜台 MaxOrderRef）：{ex.Message}");
+        }
+    }
+
+    private void PersistOrderRefHighWater(CtpTrader trader, string? brokerId, string? userId)
+    {
+        if (_orderRefStore is null || string.IsNullOrEmpty(brokerId) || string.IsNullOrEmpty(userId)) return;
+        var hw = trader.OrderRefHighWater;
+        if (hw <= 0) return;
+        // 不 await：这是审计性记账，不该给下单加一次磁盘往返。失败只落日志。
+        _ = Task.Run(async () =>
+        {
+            try { await _orderRefStore.SaveAsync(brokerId, userId, hw); }
+            catch (Exception ex) { Log($"[ctp-client] 写 OrderRef 高水位 {hw} 失败（忽略）：{ex.Message}"); }
+        });
     }
 
     public async Task OrderActionAsync(string brokerId, string investorId, int frontId, int sessionId, string orderRef, string exchangeId, string? instrumentId = null)
@@ -474,8 +532,23 @@ public class CtpSessionService : ICtpSession, IDisposable
     /// marshal 到 ThreadPool——不在 native 回调线程里 Dispose trader（否则触发 C++ 纯虚调用崩溃）。</summary>
     private void OnTraderFrontConnected(object? sender, EventArgs e)
     {
-        if (_hadLoggedIn && !_socketAlive)
-            _ = Task.Run(() => ReconnectAsync());
+        // 门控事实是「**这条 trader 实例**登过没有」，不是 _socketAlive（open-issues #3）。
+        // 旧门控要求先收到 FrontDisconnected；SDK 只回调 FrontConnected 时它永远不成立 ⇒ 重连不触发。
+        // 重连风暴不用担心：ReconnectAsync 内部 _reconnectLock.WaitAsync(0) 单飞，
+        // 且新实例在自己 LoginAsync 期间收到的 FrontConnected 因为 _traderLoggedIn=false 不会自触发。
+        if (!_hadLoggedIn) return;
+        if (_socketAlive)
+        {
+            // 状态漂移：socket 以为活着却又收到 FrontConnected。旧代码在这里什么都不做（静默丢单），
+            // 现在先记一条再走重连——这条日志就是当初缺的「客户端侧证据」。
+            Log($"[ctp-client] FrontConnected 但 _socketAlive=true（状态漂移，State={_state}）——按掉线重连处理");
+        }
+        if (!_traderLoggedIn)
+        {
+            // 这条实例还没登完成：要么是首次登录的常态（LoginAsync 正在等它），要么是重连新建的实例。
+            return;
+        }
+        _ = Task.Run(() => ReconnectAsync());
     }
 
     /// <summary>行情前置断线：标记失活（行情不影响交易状态机，仅清 tick 缓存避免脏数据）。</summary>
@@ -540,7 +613,8 @@ public class CtpSessionService : ICtpSession, IDisposable
         if (_disposed) return;   // 已释放：不再起新连接（Dispose 后到达的 FrontConnected 回调）
         if (!await _reconnectLock.WaitAsync(0)) return; // 已有重连在进行，跳过
         _reconnecting = true;
-        _state = CtpSessionState.Connecting;
+        // 进入重连 ⇒ 状态落 Connecting（不再把 Ready 当「还在连」的近似——Ready 只表示登录完成）
+        _state = CtpSessionStateMachine.Next(_state, CtpSessionEvent.SocketLost, autoReconnect: true);
         SetStatus(CtpConnectionStatus.Reconnecting);
         try
         {
@@ -567,6 +641,7 @@ public class CtpSessionService : ICtpSession, IDisposable
             var flowPath = Path.Combine(Path.GetTempPath(), "ctp_flow", Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(flowPath);
             var trader = new CtpTrader(flowPath);
+            _traderLoggedIn = false;   // 新实例尚未登录：它自己的 FrontConnected 不得触发重连（否则自我递归）
             trader.OrderReceived += OnOrderReceived;
             trader.TradeReceived += OnTradeReceived;
             trader.FrontConnected += OnTraderFrontConnected;
@@ -588,6 +663,7 @@ public class CtpSessionService : ICtpSession, IDisposable
                 try { trader.FrontConnected -= OnTraderFrontConnected; } catch { }
                 try { trader.FrontDisconnected -= OnTraderFrontDisconnected; } catch { }
                 try { trader.Dispose(); } catch { }
+                _traderLoggedIn = false;   // 作废的实例不算「登过」——否则下次 FrontConnected 会被误判成可复用
                 throw;
             }
 
@@ -596,7 +672,9 @@ public class CtpSessionService : ICtpSession, IDisposable
                 _trader = trader;
                 _loginResult = result;
                 _socketAlive = true;
+                _traderLoggedIn = true;
             }
+            await SeedOrderRefFloorAsync(trader, creds.BrokerId, creds.UserId);
             EnterReady();
             SetStatus(CtpConnectionStatus.Connected);
 

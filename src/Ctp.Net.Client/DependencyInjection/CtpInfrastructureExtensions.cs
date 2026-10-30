@@ -34,6 +34,9 @@ public static class CtpInfrastructureExtensions
         services.AddSingleton<ICtpSession>(sp => sp.GetRequiredService<CtpSessionService>());
 
         services.AddSingleton<ICtpConfigStore>(_ => SqliteCtpConfigStore.ForFile(dbPath));
+
+        // OrderRef 本地高水位（DESIGN §6 #13）：与配置同一个库文件，独立表 ctp_order_ref。
+        services.AddSingleton<IOrderRefHighWaterStore>(_ => SqliteOrderRefHighWaterStore.ForFile(dbPath));
         return services;
     }
 }

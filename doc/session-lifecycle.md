@@ -180,11 +180,11 @@
 |---|---|---|
 | 会话状态机 + epoch | **已实现** | `src/Ctp.Net.Client/CtpSessionState.cs`（`Disconnected / Connecting / Ready` + `CtpSessionNotReadyException`）；`CtpSessionService.State / Epoch / IsReady`；`EnterReady()` 是唯一进入 Ready 的写入口 |
 | Ready 前禁止下单（显式拒绝，不静默丢） | **已实现** | `CtpSessionService.GetTrader()` → `RequireReady()`：报单/撤单/查询在非 Ready 直接抛 `CtpSessionNotReadyException`（带当时的 `State` 与 `Epoch`） |
-| `FrontConnected` 无条件重建 | **未做（仍是 P0）** | 闸门还是 `_hadLoggedIn && !_socketAlive`。改它的前提是先有会话日志（否则改错方向就是重连风暴），见 §7 备注与 `session-reauth-after-reconnect.md` §7 |
+| `FrontConnected` 无条件重建 | **已实现（2026-10-30）** | 闸门换成「这条 trader 实例是否登过」（`_traderLoggedIn`）：登过又收到 `FrontConnected` 即重建重登，不再依赖是否先收到 `FrontDisconnected`。风暴由 `ReconnectAsync` 的单飞锁兜住；`_socketAlive` 与真实状态不一致时打一条漂移日志。见 `DESIGN.md` §10 |
 | 极简会话日志 | **未做（P0）** | bot 的 stdout 仍重定向到 `NUL` |
 | 在途账本 + 重连后对账 | **已实现（前置侧）** | `ctp-net-front/src/Ctp.Net.Front/FrontPendingLedger.cs` + `CtpFrontSession.ReconcilePendingAsync`：传输失败（90012-90015）才记账；下次登录重放撤单（幂等）、清理「客户端以为失败、交易所里还活着」的孤儿单 |
 | 撤单改用 `OrderSysID` | **未做（P1）** | 交易所侧撤单仍按 `(账户, OrderRef)` 定位；前置现在用「同账户重复登录踢旧会话」（`FrontSessionRegistry`）压掉 OrderRef 互踩的现实路径，但跨会话定位本身没变 |
-| `OrderRef` 本地高水位 | **未做（P1）** | 仍取柜台 `MaxOrderRef` 初始化 |
+| `OrderRef` 本地高水位 | **已实现（2026-10-30）** | core `CtpTrader.OrderRefFloor/OrderRefHighWater` + client `IOrderRefHighWaterStore`（SQLite 表 `ctp_order_ref`，只升不降）；登录起点 = `max(柜台 MaxOrderRef, 本地高水位)`。见 `DESIGN.md` §10 |
 | 240 断连挪安全点 | **未做（P2）** | 仍是攒满即断 |
 | 行情腿/交易腿独立重连 | **部分**：MD 侧有 `RebuildRpcAsync` 且已修线程安全与连接误 Dispose；交易腿断连仍会关整个交易会话（真实券商行为） | — |
 | make-before-break | **未做（P3）** | 依赖 §9 实验 1 的答案 |
