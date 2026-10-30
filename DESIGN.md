@@ -73,7 +73,7 @@
 | # | 优先级 | 项目 | 现状证据 | 建议 | 代价 / 风险 |
 |---|---|---|---|---|---|
 | 1 | P1 | 凭据文件权限 | `README.md:11` 称 chmod 600；`src/` 无 `UnixFileMode`，密码明文 | 库文件设 0600 或用钥匙串 | 跨平台分支与测试 |
-| 2 | P1 | 状态机无行为测试 | 服务 588 行；24 例只覆盖 DI、地址、SQLite | 抽出状态迁移纯函数补矩阵 | 需重构；native 难单测 |
+| 2 | ~~P1~~ **已关闭（2026-10-30）** | 状态机无行为测试 | 服务 588 行；24 例只覆盖 DI、地址、SQLite | 抽出状态迁移纯函数补矩阵 | 需重构；native 难单测 |
 | 3 | P1 | `_cachedSymbols` 并发读写 | 写在锁内（L226-248），读 L441/L513 无锁 | 锁内快照 `ToArray()` 再传入 | 低；消除并发异常 |
 | 4 | P2 | Dispose/在飞重连竞态 | `_reconnectLock.Dispose()`（L586）后，在飞任务仍 `Release`（L527） | 加 `_disposed`/CTS 检查 | 低-中；勿吞异常 |
 | 5 | P2 | 直接写 stderr | L566 `Console.Error.WriteLine`，无 `ILogger` | 注入可选 `ILogger` | 低；新增构造依赖 |
