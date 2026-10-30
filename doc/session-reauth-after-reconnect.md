@@ -1,10 +1,10 @@
 # 断线重连后未重新认证 ⇒ 报单被前置当垃圾帧丢弃（2026-10-29 事故）
 
 > 状态：**主体已修（2026-10-29），与会话门禁相关的一半见 §7**。重连路径现在会重建 trader 并**重放认证 + 登录**，且未 Ready 的写入被显式拒绝；
-> 仍缺的是「触发条件不依赖 `Disconnected` 先到」和 240 断连的安全点化。事故当时的临时处置是让两个 bot 改走**直连交易所的旁路客户端**（见 `../../aether-ctp-hosts/doc/direct-bot-bypass.md`），旁路尚未退役。
-> 归属：本仓 `CtpSessionService`（会话状态机）+ `ctp-net-core/CtpTrader`（认证原语）；诱因在 `ctp-net-front`（F0 序号 240 强制断连）。
+> 仍缺的是「触发条件不依赖 `Disconnected` 先到」（P0-1，见 §7）。~~240 断连的安全点化~~ 已作废——回收机制于 2026-10-30 整体删除并上线。事故当时的临时处置是让两个 bot 改走**直连交易所的旁路客户端**（见 `../../aether-ctp-hosts/doc/direct-bot-bypass.md`），旁路尚未退役。
+> 归属：本仓 `CtpSessionService`（会话状态机）+ `ctp-net-core/CtpTrader`（认证原语）；诱因同理在 `ctp-net-front`（F0 序号 240 强制断连，**2026-10-30 已删除**）。
 > 同批困难点汇总见 `../../aether-ctp-hosts/doc/two-bots-live-market.md`；行情投递契约见 `../../ctp-net-front/doc/md-tick-delivery.md`。
-> **怎么修、以及整条 CTP 线接下来该做什么**：`session-lifecycle.md`（会话语义、状态机 + epoch、在途对账、240 断连的消除路径、待实测清单）。
+> **怎么修、以及整条 CTP 线接下来该做什么**：`session-lifecycle.md`（会话语义、状态机 + epoch、在途对账、待实测清单）。
 
 ## 1. 现象
 
@@ -61,11 +61,19 @@ CTP 的 `ReqAuthenticate`/`ReqUserLogin` 语义绑定在**当前 TCP 连接**上
 `CtpSessionService` 的重登入口是本仓 `src/Ctp.Net.Client/CtpSessionService.cs:427`：
 
 ```csharp
+// 事故当时的写法（已改）
 private void OnTraderFrontConnected(object? sender, EventArgs e)
 {
     if (_hadLoggedIn && !_socketAlive)      // ← 门控建立在「先收到 Disconnected」之上
         _ = Task.Run(() => ReconnectAsync());
 }
+
+// 现在的写法（f0bc109）：门控事实换成「这条 trader 实例登过没有」
+if (!_hadLoggedIn) return;
+if (_socketAlive)
+    Log("[ctp-client] FrontConnected 但 _socketAlive=true（状态漂移）——按掉线重连处理");
+if (!_traderLoggedIn) return;               // 这条实例还没登完成（首次登录或重连中）
+_ = Task.Run(() => ReconnectAsync());
 ```
 
 只有当 `FrontDisconnected` 先把 `_socketAlive` 置假（`:417-419`），随后的 `FrontConnected` 才会触发 `ReconnectAsync()`（重建 `CtpTrader` → 认证 → 登录）。
@@ -80,9 +88,11 @@ if (!_hadLoggedIn || _socketAlive || _reconnecting) return;   // _socketAlive �
 
 于是系统进入「看起来一切正常、实际报单全丢」的静默失败：状态没变 Reconnecting、UI 没有告警、策略照常下单。
 
-### 3.4 待确认项（阻塞精确定位）
+### 3.4 待确认项（**2026-10-30 已解**：不再需要区分，改成两种都覆盖）
 
-上面的 3.3 有两种可能：**(a)** SDK 对服务端 `Close` 不触发 `OnFrontDisconnected`；**(b)** 触发了但 `_socketAlive` 被别处（如 `:173` 的登录成功路径）重新置真。要区分必须看**客户端侧**证据，而当前 bot 的 stdout 被重定向到 `NUL`（见 3.5），没有会话日志。
+上面的 3.3 有两种可能：**(a)** SDK 对服务端 `Close` 不触发 `OnFrontDisconnected`；**(b)** 触发了但 `_socketAlive` 被别处（如 `:173` 的登录成功路径）重新置真。要区分必须看**客户端侧**证据。
+
+**2026-10-30 的处理**：不做二选一，把门控事实直接换成「这条 trader 实例登过没有」（`_traderLoggedIn`，`f0bc109`），(a) 和 (b) 都会走到重建；同时 `_socketAlive=true` 又收到 `FrontConnected` 时**先记一条状态漂移日志**再重建——这条日志就是当初缺的证据，下次再出问题能直接判定是哪一种。会话日志也已恢复（不再 `>NUL`）。
 
 ### 3.5 为什么这次只能倒推
 
@@ -90,7 +100,8 @@ if (!_hadLoggedIn || _socketAlive || _reconnecting) return;   // _socketAlive �
 
 ## 4. 影响面
 
-- 任何长跑的 bot / 客户端都会在 F0 序号攒满 240 条后被前置断连一次；只要重连没有重新认证，**其后所有报单静默丢失**，且状态显示仍然是「已连接」。
+- ~~任何长跑的 bot / 客户端都会在 F0 序号攒满 240 条后被前置断连一次~~ —— **2026-10-30 起不再发生**：回收机制整体删除并上线（front=`2e4867b`），序号只增不断连。本条按事故当时（2026-10-29）的机制记录。
+- 但只要重连没有重新认证，**其后所有报单静默丢失**，且状态显示仍然是「已连接」——这部分风险仍在，只是触发源（周期性断连）没有了；真实的前置重启/网络抖动同样会走到这条路径。
 - 表现与「策略没信号」「交易所没成交」混淆，排查成本极高（本次从怀疑客户端 → 怀疑交易所 → 定位到认证状态，耗时约 1 小时）。
 - 历史上服务器双 bot 的多次「莫名停摆」很可能同源。
 
@@ -103,9 +114,11 @@ if (!_hadLoggedIn || _socketAlive || _reconnecting) return;   // _socketAlive �
 3. **未 Ready 时拒绝报单**：会话未认证/未登录时，报单路径直接抛 `CtpSessionNotReadyException`，**不要**把帧写进一个注定被丢的连接。当前行为是静默丢，等于黑洞。
 4. **状态要可见**：重连期间 `CtpConnectionStatus` 必须真的切到 `Reconnecting`；`_socketAlive` 与真实连接状态不一致时报警（例如 `FrontConnected` 时发现 `_socketAlive==true` 说明状态漂移，记一条明确日志）。
 
-### P1（`ctp-net-front`，可选）
+### P1（`ctp-net-front`）—— **已作废：不是"挪安全点"，是整段删掉**
 
-240 断连无法取消，但可以把它挪到**安全点**：等到「无在途报单回报 + 出站队列空 + 距上次业务帧有短静默」再 `Close`，减少断在报单中间的概率。当前实现是攒满即断（`:306`），会与客户的报单突发正面撞车。
+原方案假定「240 断连无法取消」，只能把它挪到安全点（无在途回报 + 出站队列空 + 短静默后再 `Close`）。
+**这个前提 2026-10-30 被实测推翻**（单会话连推 900 帧、客户端零丢失 ⇒ 251 不是天花板），回收逻辑（软点/硬点/安全点）已在 `2e4867b` 整体删除并上线，不再有周期性断连，也就不存在"挪"的问题。
+现在的行为：序号越过 240 只打一行日志，逼近 16 位编码上限（65000）才视为异常。详见 `aether-ctp-hosts/doc/ctp-line/history/2026-10.md` #2。
 
 ### P2（`aether-ctp-hosts`，必做）
 
@@ -113,21 +126,24 @@ if (!_hadLoggedIn || _socketAlive || _reconnecting) return;   // _socketAlive �
 
 ## 6. 复现与验证
 
-1. 正常跑两个 bot，等前置日志出现 `F0 推送序号达 240 上限`（活跃时几秒一次）。
-2. 观察随后是否出现 `认证: broker=... user=<bot>`：正常应有；若缺失且紧接着出现 `非预期帧（等认证）`，即命中本缺陷。
-3. 统计丢单量：
+> **触发源变了**：2026-10-30 之前靠「攒满 240 条推送」自然触发断连；回收删除后，这条路径不复存在。
+> 现在要验重认证，得**人为制造一次断连**：重启前置进程，或直接掐掉 socket。这比等日志更可控，也更接近真实故障。
+
+1. 起一个 bot（`Aether.DirectBot` 或桌面端），确认已 `认证 / 登录`。
+2. **掐前置**：`Restart-Service AetherCtpFront`（或停掉再起）。
+3. 盯客户端侧会话日志（#4 已恢复按天轮转的会话日志）：应先 `断开(reason)` → `重连` → `认证` → `登录` → 会话重建，全程 `State` 从 `Ready` 落到 `Connecting` 再回 `Ready`、`Epoch` 自增。
+4. 前置侧对照：
 
 ```powershell
 $log = 'C:\Aether\ctpsim-data\ctpsim-front.log'
 $t = Get-Content $log -Tail 250000 -Encoding UTF8
 ($t | Select-String -SimpleMatch '认证: broker').Count
-($t | Select-String -SimpleMatch '240 上限').Count
-($t | Select-String -SimpleMatch '等认证').Count     # 注意：日志按 UTF-8 读，用 -Encoding UTF8
+($t | Select-String -SimpleMatch '等认证').Count     # 应严格为 0
 ```
 
-> 注意：该日志是 **UTF-8**，`Get-Content` 默认按 ANSI/GBK 解码会让中文匹配全部落空（本次排查踩过一次）。
+> 该日志是 **UTF-8**，`Get-Content` 默认按 ANSI/GBK 解码会让中文匹配全部落空（本次排查踩过一次）。
 
-4. 修复验收：同场景下 `等认证` 计数应为 0，且每次 `240 上限` 之后 1~2 秒内必然出现对应的 `认证/登录` 行。
+5. 验收：`等认证` 计数为 0；断连期间发单抛 `CtpSessionNotReadyException`（不是静默丢）；重连后 `Epoch` 变化可被调用方看到。
 
 ## 7. 2026-10-29 更新：实际改了什么、还剩什么
 
@@ -143,9 +159,9 @@ $t = Get-Content $log -Tail 250000 -Encoding UTF8
 
 ### 仍缺（都是本文件 §5 里未做的项）
 
-1. **触发条件仍依赖回调顺序**（P0-1）：`OnTraderFrontConnected` 还是 `if (_hadLoggedIn && !_socketAlive)`。§3.4 的 (a)/(b) 两种可能至今**没有客户端证据**能区分——要动它必须先补会话日志（P2），否则改错方向会引入重连风暴。
+1. ~~**触发条件仍依赖回调顺序**（P0-1）~~ —— **2026-10-30 已改（未部署）**：`OnTraderFrontConnected` 的门控从 `if (_hadLoggedIn && !_socketAlive)` 换成「这条 trader 实例登过没有」（`_traderLoggedIn`，`f0bc109`），并补了状态漂移日志——那正是 §3.4 一直缺的客户端侧证据。重连风暴由 `ReconnectAsync` 的单飞锁兜住。代码已合入（`f0bc109`），但**没在真实断连下跑过**——bot 与桌面端跑的都还不是这份构建。
 2. **`CtpTrader.IsAuthenticated` 未提供**（P0-2）：认证状态仍只存在于 SDK 内部；本层的 Ready 是「登录 + 结算确认都成功」的等价物，够门禁用，但拿不到「认证已过、登录未过」这一中间态。
-3. **240 断连未挪安全点**（P1）：仍是攒满即断。
-4. **会话日志未恢复**（P2）：bot 的 stdout 依旧重定向到 `NUL`。
+3. ~~**240 断连未挪安全点**（P1）：仍是攒满即断~~ —— **2026-10-30 已作废**：回收机制整体删除并上线，周期性断连这个触发源本身没了（front=`2e4867b`）。
+4. ~~**会话日志未恢复**（P2）~~ —— **2026-10-30 已恢复**：启动器改带会话日志（按天 + 64MB 轮转上限），客户端侧从此有第一手证据。
 
-> 验收口径不变：`等认证` 计数为 0，且每次 `240 上限` 后 1~2 秒内必有 `认证/登录` 行。区别是现在「没有 Ready 就发单」这件事在客户端侧就有明确异常，不再需要靠前置日志反推。
+> 验收口径（2026-10-30 更新）：`等认证` 计数严格为 0；人为掐前置后，客户端必须走出 `断开 → 重连 → 认证 → 登录 → Ready`，`Epoch` 自增；断连窗口内发单抛 `CtpSessionNotReadyException` 而非静默丢弃。

@@ -100,7 +100,7 @@
 | 未 Ready 时不静默丢帧 | 同上（门禁） | 对应 `session-reauth-after-reconnect.md` §5 的 P0-3 |
 
 仍缺（与本轮无关、已被文档钉住）：`FrontConnected` 仍以 `_socketAlive` 为闸（§6 之外，见 `doc/session-lifecycle.md` §11）、
-会话日志未恢复、240 断连未挪安全点。
+240 断连已于 2026-10-30 整体删除（不再有周期性断连）；会话日志已恢复（按天 + 64MB 轮转）。详见 `aether-ctp-hosts/doc/ctp-line/open-issues.md`。
 
 ## 9. 本轮升级落地（2026-10-30）：状态机行为测试（§6 #2）
 

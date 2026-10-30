@@ -138,7 +138,7 @@
 |---|---|---|
 | 极简会话日志 | 只记 `连接 / 认证 / 登录 / 断开(reason) / 重建 / Ready / 会话被踢`，按天轮转 + 单文件上限 | 判定"到底有没有重登"（本次事故就是这里没有证据） |
 | `session_age` / `epoch` | 心跳或日志里带上 | 判断"是不是刚重建过" |
-| `reconnect_count` / `relogin_latency_ms` | 计数 + 分位 | 240 断连的实际频率与重建耗时 |
+| `reconnect_count` / `relogin_latency_ms` | 计数 + 分位 | 真实断连（前置重启 / 网络抖动）的频率与重建耗时 |
 | `in_flight_unknown` | 断连时未终态的单数 | 直接量化"可能丢了多少" |
 | `orders_rejected_unauthenticated` | 前置侧的 `等认证` 计数（前置已有）与客户端侧配对 | 这条一旦非零就是本类缺陷复发 |
 
@@ -150,13 +150,13 @@
 | **P0** | 极简会话日志（几十 KB/天） | 能从前置+客户端两份日志还原每一次会话的生死 |
 | **P1** | 在途账本 + 重连后 `ReqQryOrder` 对账；撤单改用 `OrderSysID` | 断连期间发起的撤单，100% 在重连后落地或明确标记失败 |
 | **P1** | `OrderRef` 本地高水位（落盘到既有 `SqliteCtpConfigStore`），取 `max(本地, MaxOrderRef)+1` | 进程重启后报单 ref 不重复、不回卷 |
-| **P2** | 240 断连挪到安全点（方案 A2：前置回显本会话帧数，客户端择机重建） | 活跃行情下连续 30 分钟无"凑数掐断" |
+| ~~**P2**~~ | ~~240 断连挪到安全点~~ —— **2026-10-30 作废**：回收机制整体删除并上线（`front=2e4867b`），「凑数掐断」这个触发源不存在了 | ~~活跃行情下连续 30 分钟无凑数掐断~~ → 由 #2 的 900 帧连推实测替代 |
 | **P2** | 行情腿与交易腿**独立重连**（互不牵连），并做订阅幂等重订 | 只掐行情腿时不触发交易腿重建 |
 | **P3** | make-before-break 交接（先做实 §9 实验 1） | 切换期间 `Ready` 覆盖率为 100% |
 
 ## 8. 直连旁路什么时候退役
 
-同时满足即退役（与 `direct-bot-bypass.md` §8 一致）：P0 全部 + P1 的撤单对账 + 240 断连不再影响交易。在此之前，旁路是**降低风险的临时形态**，不是架构方向——它绕开的正是本文要修的东西。
+同时满足即退役（与 `direct-bot-bypass.md` §8 一致）：P0 全部 + P1 的撤单对账 + ~~240 断连不再影响交易~~（**该触发源 2026-10-30 已删除**，这一项自动满足）。在此之前，旁路是**降低风险的临时形态**，不是架构方向——它绕开的正是本文要修的东西。
 
 ## 9. 待实测清单（对真柜台，不能靠猜）
 
@@ -171,25 +171,25 @@
 ## 10. 相关
 
 - 本次事故复盘：`session-reauth-after-reconnect.md`
-- 前置 240 断连的来龙去脉：`../../aether-ctp-hosts/doc/two-bots-live-market.md` §2.2
+- 前置 240 断连的来龙去脉（**已推翻，回收于 2026-10-30 删除**）：`../../aether-ctp-hosts/doc/two-bots-live-market.md` §2.2
 - 临时处置（直连旁路）：`../../aether-ctp-hosts/doc/direct-bot-bypass.md`
 - 行情侧投递契约（另一条独立的重建路径：订阅幂等）：`../../ctp-net-front/doc/md-tick-delivery.md`
 
 ## 11. 实现状态（2026-10-29 盘点）
 
 > 本轮修完后仍在开放的问题（含 #3/#4 这两条阻塞项）统一收在
-> `../../../aether-ctp-hosts/doc/ctp-line/open-issues.md`——那是跨仓总册，本节只记会话线的落地状态。
+> `../../aether-ctp-hosts/doc/ctp-line/open-issues.md`——那是跨仓总册，本节只记会话线的落地状态。
 
 | §7 项 | 状态 | 落点 / 说明 |
 |---|---|---|
 | 会话状态机 + epoch | **已实现** | `src/Ctp.Net.Client/CtpSessionState.cs`（`Disconnected / Connecting / Ready` + `CtpSessionNotReadyException`）；`CtpSessionService.State / Epoch / IsReady`；`EnterReady()` 是唯一进入 Ready 的写入口 |
 | Ready 前禁止下单（显式拒绝，不静默丢） | **已实现** | `CtpSessionService.GetTrader()` → `RequireReady()`：报单/撤单/查询在非 Ready 直接抛 `CtpSessionNotReadyException`（带当时的 `State` 与 `Epoch`） |
 | `FrontConnected` 无条件重建 | **已实现（2026-10-30）** | 闸门换成「这条 trader 实例是否登过」（`_traderLoggedIn`）：登过又收到 `FrontConnected` 即重建重登，不再依赖是否先收到 `FrontDisconnected`。风暴由 `ReconnectAsync` 的单飞锁兜住；`_socketAlive` 与真实状态不一致时打一条漂移日志。见 `DESIGN.md` §10 |
-| 极简会话日志 | **未做（P0）** | bot 的 stdout 仍重定向到 `NUL` |
+| 极简会话日志 | **已做（2026-10-30）** | 启动器改带会话日志：按天 + 64MB 上限轮转；不再是 `>NUL` |
 | 在途账本 + 重连后对账 | **已实现（前置侧）** | `ctp-net-front/src/Ctp.Net.Front/FrontPendingLedger.cs` + `CtpFrontSession.ReconcilePendingAsync`：传输失败（90012-90015）才记账；下次登录重放撤单（幂等）、清理「客户端以为失败、交易所里还活着」的孤儿单 |
 | 撤单改用 `OrderSysID` | **未做（P1）** | 交易所侧撤单仍按 `(账户, OrderRef)` 定位；前置现在用「同账户重复登录踢旧会话」（`FrontSessionRegistry`）压掉 OrderRef 互踩的现实路径，但跨会话定位本身没变 |
 | `OrderRef` 本地高水位 | **已实现（2026-10-30）** | core `CtpTrader.OrderRefFloor/OrderRefHighWater` + client `IOrderRefHighWaterStore`（SQLite 表 `ctp_order_ref`，只升不降）；登录起点 = `max(柜台 MaxOrderRef, 本地高水位)`。见 `DESIGN.md` §10 |
-| 240 断连挪安全点 | **未做（P2）** | 仍是攒满即断 |
+| ~~240 断连挪安全点~~ | **作废（2026-10-30）** | 回收机制整体删除并上线（`front=2e4867b`），不再有周期性断连 |
 | 行情腿/交易腿独立重连 | **部分**：MD 侧有 `RebuildRpcAsync` 且已修线程安全与连接误 Dispose；交易腿断连仍会关整个交易会话（真实券商行为） | — |
 | make-before-break | **未做（P3）** | 依赖 §9 实验 1 的答案 |
 
