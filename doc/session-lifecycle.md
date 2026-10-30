@@ -1,6 +1,8 @@
 # CTP 会话语义与重建：为什么"保持会话"做不到，该建什么
 
-> 面向：要继续改 CTP 这条线的人。这是**设计文档**（问题 + 方案 + 路线图），不含实现。
+> 面向：要继续改 CTP 这条线的人。这是**设计文档**（问题 + 方案 + 路线图）。
+> **2026-10-29：§3 的状态机 + epoch、§4 的「未 Ready 拒绝写入」、§4.3 的在途动作对账（撤单重放 / 孤儿单清理）已实现**，
+> 落点与剩余项见 §11（实现状态表）；本文其余部分仍按设计稿阅读。
 > 现状缺陷复盘：`session-reauth-after-reconnect.md`；前置侧的 240 强制断连：`../../aether-ctp-hosts/doc/two-bots-live-market.md` §2.2；直连旁路（临时处置）：`../../aether-ctp-hosts/doc/direct-bot-bypass.md`。
 
 ## 0. 结论先行
@@ -168,3 +170,23 @@
 - 前置 240 断连的来龙去脉：`../../aether-ctp-hosts/doc/two-bots-live-market.md` §2.2
 - 临时处置（直连旁路）：`../../aether-ctp-hosts/doc/direct-bot-bypass.md`
 - 行情侧投递契约（另一条独立的重建路径：订阅幂等）：`../../ctp-net-front/doc/md-tick-delivery.md`
+
+## 11. 实现状态（2026-10-29 盘点）
+
+> 本轮修完后仍在开放的问题（含 #3/#4 这两条阻塞项）统一收在
+> `../../ctp-net-front/doc/open-issues.md`——那张表是跨仓唯一入口，本节只记会话线的落地状态。
+
+| §7 项 | 状态 | 落点 / 说明 |
+|---|---|---|
+| 会话状态机 + epoch | **已实现** | `src/Ctp.Net.Client/CtpSessionState.cs`（`Disconnected / Connecting / Ready` + `CtpSessionNotReadyException`）；`CtpSessionService.State / Epoch / IsReady`；`EnterReady()` 是唯一进入 Ready 的写入口 |
+| Ready 前禁止下单（显式拒绝，不静默丢） | **已实现** | `CtpSessionService.GetTrader()` → `RequireReady()`：报单/撤单/查询在非 Ready 直接抛 `CtpSessionNotReadyException`（带当时的 `State` 与 `Epoch`） |
+| `FrontConnected` 无条件重建 | **未做（仍是 P0）** | 闸门还是 `_hadLoggedIn && !_socketAlive`。改它的前提是先有会话日志（否则改错方向就是重连风暴），见 §7 备注与 `session-reauth-after-reconnect.md` §7 |
+| 极简会话日志 | **未做（P0）** | bot 的 stdout 仍重定向到 `NUL` |
+| 在途账本 + 重连后对账 | **已实现（前置侧）** | `ctp-net-front/src/Ctp.Net.Front/FrontPendingLedger.cs` + `CtpFrontSession.ReconcilePendingAsync`：传输失败（90012-90015）才记账；下次登录重放撤单（幂等）、清理「客户端以为失败、交易所里还活着」的孤儿单 |
+| 撤单改用 `OrderSysID` | **未做（P1）** | 交易所侧撤单仍按 `(账户, OrderRef)` 定位；前置现在用「同账户重复登录踢旧会话」（`FrontSessionRegistry`）压掉 OrderRef 互踩的现实路径，但跨会话定位本身没变 |
+| `OrderRef` 本地高水位 | **未做（P1）** | 仍取柜台 `MaxOrderRef` 初始化 |
+| 240 断连挪安全点 | **未做（P2）** | 仍是攒满即断 |
+| 行情腿/交易腿独立重连 | **部分**：MD 侧有 `RebuildRpcAsync` 且已修线程安全与连接误 Dispose；交易腿断连仍会关整个交易会话（真实券商行为） | — |
+| make-before-break | **未做（P3）** | 依赖 §9 实验 1 的答案 |
+
+> 验收口径：`orders_rejected_unauthenticated`（前置 `等认证` 计数）必须为 0；人为掐前置 20 次，每次 2s 内应回 `Ready`——这一条**还没人跑过**，属于下一步要补的实测。

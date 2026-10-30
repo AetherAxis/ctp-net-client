@@ -37,6 +37,12 @@ public class CtpSessionService : ICtpSession, IDisposable
     private volatile bool _mdHadSubscribed;      // 是否曾成功订阅过行情（区分首次连接 vs 重连）
     private volatile bool _mdReconnecting;       // MD 重连进行中（重入守卫——见 ReconnectMdAsync 注释）
     private CtpConnectionStatus _status = CtpConnectionStatus.Disconnected;
+
+    /// <summary>会话状态机（2026-10-29——见 <see cref="CtpSessionState"/>）。写入类操作只在 Ready 时放行。</summary>
+    private volatile CtpSessionState _state = CtpSessionState.Disconnected;
+
+    /// <summary>会话纪元：每次「Ready」自增。上层用它判断「重发时的会话与失败时是不是同一条」。</summary>
+    private long _epoch;
     private CtpConnectRequest? _cachedTraderCreds;          // 重登用缓存凭据
     private MdCreds? _cachedMdCreds;                          // 行情重订阅缓存
     private readonly List<string> _cachedSymbols = new();    // 重订阅缓存合约
@@ -50,6 +56,46 @@ public class CtpSessionService : ICtpSession, IDisposable
 
     /// <summary>socket 存活 && 对象未释放才算已连接（修复"前置关闭后 IsConnected 仍 true"的假状态）。</summary>
     public bool IsConnected => _trader != null && !_trader.IsDisposed && _socketAlive;
+
+    /// <summary>当前会话状态（状态机见 <see cref="CtpSessionState"/>）。</summary>
+    public CtpSessionState State => _state;
+
+    /// <summary>会话纪元：每次进入 Ready 自增（0 = 从未就绪）。</summary>
+    public long Epoch => Interlocked.Read(ref _epoch);
+
+    /// <summary>是否已就绪（认证 + 登录 + 结算确认都完成）。写入类操作的前置条件。</summary>
+    public bool IsReady => _state == CtpSessionState.Ready;
+
+    /// <summary>
+    /// 取 trader 并要求会话 Ready——<b>写入/查询的唯一入口</b>（2026-10-29）。
+    /// 旧版直接返回 <c>_trader</c>：断线窗口里那个 trader 的 socket 已经死了，native 调用要么
+    /// 静默排队（报单蒸发）、要么抛一个语义含混的 rc 错——两种都没有「等一下再发」的信息。
+    /// </summary>
+    private CtpTrader RequireReady(string operation)
+    {
+        lock (_lock)
+        {
+            if (_state != CtpSessionState.Ready || _trader is null || _trader.IsDisposed)
+                throw new CtpSessionNotReadyException(_state, Epoch, operation);
+            return _trader;
+        }
+    }
+
+    /// <summary>进入 Ready（唯一写入口：登录成功 / 重登成功）。</summary>
+    private void EnterReady()
+    {
+        Interlocked.Increment(ref _epoch);
+        _state = CtpSessionState.Ready;
+    }
+
+    /// <summary>
+    /// socket 失活后的状态落点：盘中 ⇒ <see cref="CtpSessionState.Connecting"/>（等重连重登），
+    /// 闭市/放弃重连 ⇒ <see cref="CtpSessionState.Disconnected"/>。
+    /// </summary>
+    private void LeaveReady()
+    {
+        _state = ShouldAutoReconnect() ? CtpSessionState.Connecting : CtpSessionState.Disconnected;
+    }
 
     public bool IsMdSubscribed => _md != null && !_md.IsDisposed;
 
@@ -121,6 +167,7 @@ public class CtpSessionService : ICtpSession, IDisposable
             _hadLoggedIn = true;
         }
 
+        EnterReady();
         StartSafetyTimer();
         SetStatus(CtpConnectionStatus.Connected);
         return result;
@@ -175,46 +222,46 @@ public class CtpSessionService : ICtpSession, IDisposable
             _mdSocketAlive = false;
             _mdHadSubscribed = false;
         }
+        _state = CtpSessionState.Disconnected;
         SetStatus(CtpConnectionStatus.Disconnected);
     }
 
-    internal CtpTrader GetTrader()
-    {
-        lock (_lock)
-        {
-            return _trader ?? throw new InvalidOperationException("CTP 未登录");
-        }
-    }
+    /// <summary>
+    /// 取 trader，<b>会话未就绪即抛 <see cref="CtpSessionNotReadyException"/></b>（2026-10-29）。
+    /// 旧版在「已登录但 socket 已死」时照样把 trader 交出去——native 调用落进死连接，
+    /// 报单静默蒸发（复盘里 117 单被当垃圾帧丢弃的同族缺口）。现在失败是显式的、可重试的。
+    /// </summary>
+    internal CtpTrader GetTrader(string operation = "交易/查询") => RequireReady(operation);
 
     // —— 原生查询/交易方法（供同程序集 AI 工具使用）——
 
     public async Task<Account> QueryTradingAccountAsync(string brokerId, string accountId)
     {
-        var trader = GetTrader();
+        var trader = GetTrader("查询资金");   // 未就绪即抛——不把查询排到死连接上
         return await trader.QueryTradingAccountAsync(brokerId, accountId);
     }
 
     public async Task<IReadOnlyList<Position>> QueryInvestorPositionAsync(string brokerId, string investorId, string? instrumentId = null)
     {
-        var trader = GetTrader();
+        var trader = GetTrader("查询持仓");
         return await trader.QueryInvestorPositionAsync(brokerId, investorId, instrumentId);
     }
 
     public async Task<OrderInsertResult> OrderInsertAsync(OrderRequest request)
     {
-        var trader = GetTrader();
+        var trader = GetTrader("报单");   // 断线窗口内直接拒绝：不排队、不静默丢弃
         return await trader.OrderInsertAsync(request);
     }
 
     public async Task OrderActionAsync(string brokerId, string investorId, int frontId, int sessionId, string orderRef, string exchangeId, string? instrumentId = null)
     {
-        var trader = GetTrader();
+        var trader = GetTrader("撤单");
         await trader.OrderActionAsync(brokerId, investorId, frontId, sessionId, orderRef, exchangeId, instrumentId);
     }
 
     public async Task<IReadOnlyList<Order>> QueryOrderAsync(string brokerId, string investorId, string? instrumentId = null)
     {
-        var trader = GetTrader();
+        var trader = GetTrader("查询报单");
         return await trader.QueryOrderAsync(brokerId, investorId, instrumentId);
     }
 
@@ -333,7 +380,7 @@ public class CtpSessionService : ICtpSession, IDisposable
     /// 真实前置返回全市场清单（~1.6 万行，LZ4 批量格式——SDK 自己解）。板子只在 sim 分支调用。</summary>
     async Task<IReadOnlyList<CtpInstrument>> ICtpSession.QueryInstrumentsAsync(CancellationToken ct)
     {
-        var trader = GetTrader();
+        var trader = GetTrader("查询合约");
         var items = await trader.QueryInstrumentsAsync(ct: ct);
         return items.Select(i => new CtpInstrument
         {
@@ -417,6 +464,7 @@ public class CtpSessionService : ICtpSession, IDisposable
     private void OnTraderFrontDisconnected(object? sender, int reason)
     {
         _socketAlive = false;
+        LeaveReady();   // 断线即刻关闸：此刻到重登完成之间不允许发单（旧版这段窗口是黑洞）
         SetStatus(ShouldAutoReconnect()
             ? CtpConnectionStatus.Reconnecting
             : CtpConnectionStatus.Closed);
@@ -492,6 +540,7 @@ public class CtpSessionService : ICtpSession, IDisposable
         if (_disposed) return;   // 已释放：不再起新连接（Dispose 后到达的 FrontConnected 回调）
         if (!await _reconnectLock.WaitAsync(0)) return; // 已有重连在进行，跳过
         _reconnecting = true;
+        _state = CtpSessionState.Connecting;
         SetStatus(CtpConnectionStatus.Reconnecting);
         try
         {
@@ -523,7 +572,24 @@ public class CtpSessionService : ICtpSession, IDisposable
             trader.FrontConnected += OnTraderFrontConnected;
             trader.FrontDisconnected += OnTraderFrontDisconnected;
 
-            var result = await trader.LoginAsync(creds);
+            LoginResult result;
+            try
+            {
+                result = await trader.LoginAsync(creds);
+            }
+            catch
+            {
+                // 重建失败必须把这条**新** trader 收掉（2026-10-29 修）：旧版 catch 只置 _socketAlive=false，
+                // 既不 Dispose 也不摘事件，而它从未赋给 _trader —— Logout/Dispose 永远够不到它。
+                // 结果是每次重连失败都漏一条仍在后台自动重连 + 自动重登的幽灵连接（与首次登录路径
+                // 专门写的清理正好相反，那段注释描述的也是这个失败模式）。
+                try { trader.OrderReceived -= OnOrderReceived; } catch { }
+                try { trader.TradeReceived -= OnTradeReceived; } catch { }
+                try { trader.FrontConnected -= OnTraderFrontConnected; } catch { }
+                try { trader.FrontDisconnected -= OnTraderFrontDisconnected; } catch { }
+                try { trader.Dispose(); } catch { }
+                throw;
+            }
 
             lock (_lock)
             {
@@ -531,6 +597,7 @@ public class CtpSessionService : ICtpSession, IDisposable
                 _loginResult = result;
                 _socketAlive = true;
             }
+            EnterReady();
             SetStatus(CtpConnectionStatus.Connected);
 
             // 重新订阅行情（若有缓存）——同样取快照（_cachedSymbols 在锁内会被改）
@@ -548,6 +615,7 @@ public class CtpSessionService : ICtpSession, IDisposable
         {
             // 重登失败：保持失活。盘中定时器继续重试；闭市切 Closed。
             _socketAlive = false;
+            LeaveReady();
             SetStatus(ShouldAutoReconnect()
                 ? CtpConnectionStatus.Reconnecting
                 : CtpConnectionStatus.Closed);

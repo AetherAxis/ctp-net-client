@@ -35,7 +35,11 @@
 ### 3.3 断线 / 闭市 / 重连状态机 + 30s 安全定时器
 - **决策**：断线置 `_socketAlive=false`，按 `ShouldAutoReconnect()` 切 `Reconnecting`/`Closed`；仿真前置恒重连，真实前置按交易日历。`FrontConnected` 且曾登录则 `Task.Run(ReconnectAsync)`；30s `Timer` 兜底；`SemaphoreSlim.WaitAsync(0)` 防并发；行情腿独立状态 + 重入守卫，失败 5s 退避。
 - **理由**：重连后会话失效须重登重订阅；SDK 可能放弃重连；native 回调内 Dispose 触发 C++ 纯虚崩溃；MD 重登会自触发风暴。
-- **代价**：十余个可变标志靠约定；无行为测试；无重连上限。
+- **会话门禁（2026-10-29 补）**：在上面这套「可变标志」之上加一层显式状态：`State`（`Disconnected / Connecting / Ready`）
+  与单调自增的 `Epoch`（`CtpSessionState.cs`）。所有对外写入（报单/撤单/查询）先过 `RequireReady()`，
+  非 Ready 直接抛 `CtpSessionNotReadyException`（带当时的 `State` 与 `Epoch`），**不再把帧写进一个注定被丢的连接**。
+  `Epoch` 让调用方能判断「重发时的会话与失败时是不是同一条」。
+- **代价**：十余个可变标志仍靠约定（状态机是叠加层，不是替换层）；状态迁移本身仍无行为测试（§6 #2）；无重连上限。
 
 ### 3.4 凭据 SQLite：多档案 + 幂等迁移
 - **决策**：`ctp_profile` 多行表，`is_last_used` 唯一性由 `SaveAsync` 事务内降级其它行；旧 `ctp_config` 保留为种子/回滚安全；`MigrateAsync` 幂等补列并在表空时种一行；WAL + `busy_timeout=5000`。
@@ -49,7 +53,7 @@
 
 ## 4. 运行与验证
 
-`dotnet test ctp-net-client.slnx`：24 例（DI 1 + SimFront Theory 13 + SQLite 10），纯逻辑、不触发 native 登录。CI 在 ubuntu-latest/.NET 10.0.x 并排 checkout 三仓，注入 GitHub Packages 凭据后 Release build + test。本次未跑测试。
+`dotnet test ctp-net-client.slnx`：25 例（DI 1 + SimFront Theory 13 + SQLite 11），纯逻辑、不触发 native 登录；会话状态机目前**没有直接用例**（§6 #2）。CI 在 ubuntu-latest/.NET 10.0.x 并排 checkout 三仓，注入 GitHub Packages 凭据后 Release build + test。本次未跑测试。
 
 ## 5. 升级记录（2026-10-24）
 
@@ -86,3 +90,14 @@
 - 新增测试：凭据库文件权限为 0600。
 
 **未做（有意）**：第 2 项状态机行为测试需要把 588 行的 native 服务抽出纯函数矩阵（重构面大，须与 E2 验证一起做）；第 7 项切 PackageReference 需先发包并版本对齐。
+
+## 8. 本轮升级落地（2026-10-29）
+
+| 项 | 落点 | 说明 |
+|---|---|---|
+| 会话状态机 + Ready 门禁 | 新增 `src/Ctp.Net.Client/CtpSessionState.cs`；`CtpSessionService.State / Epoch / IsReady / RequireReady()` | 断线即离开 Ready；报单/撤单/查资金/查持仓/查报单/查合约六个调用点都带上操作名，异常里能看出是哪一步被拒 |
+| 重连失败不漏连接 | `ReconnectAsync` 的 catch 分支摘事件 + `Dispose` 新建的 trader 再抛 | 旧版把这条从未挂到 `_trader` 的实例直接丢掉，它会继续在后台自动重连/重登 ⇒ 每 30s 的重试都留一条幽灵连接 |
+| 未 Ready 时不静默丢帧 | 同上（门禁） | 对应 `session-reauth-after-reconnect.md` §5 的 P0-3 |
+
+仍缺（与本轮无关、已被文档钉住）：`FrontConnected` 仍以 `_socketAlive` 为闸（§6 之外，见 `doc/session-lifecycle.md` §11）、
+会话日志未恢复、240 断连未挪安全点。

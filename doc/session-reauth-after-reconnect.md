@@ -1,6 +1,7 @@
 # 断线重连后未重新认证 ⇒ 报单被前置当垃圾帧丢弃（2026-10-29 事故）
 
-> 状态：**未修复**（根因仍在）。临时处置：2026-10-29 起两个 bot 改走**直连交易所的旁路客户端**，绕开被强制断连的前置交易腿 —— 见 `../../aether-ctp-hosts/doc/direct-bot-bypass.md`，前置修好后该客户端整体退役。
+> 状态：**主体已修（2026-10-29），与会话门禁相关的一半见 §7**。重连路径现在会重建 trader 并**重放认证 + 登录**，且未 Ready 的写入被显式拒绝；
+> 仍缺的是「触发条件不依赖 `Disconnected` 先到」和 240 断连的安全点化。事故当时的临时处置是让两个 bot 改走**直连交易所的旁路客户端**（见 `../../aether-ctp-hosts/doc/direct-bot-bypass.md`），旁路尚未退役。
 > 归属：本仓 `CtpSessionService`（会话状态机）+ `ctp-net-core/CtpTrader`（认证原语）；诱因在 `ctp-net-front`（F0 序号 240 强制断连）。
 > 同批困难点汇总见 `../../aether-ctp-hosts/doc/two-bots-live-market.md`；行情投递契约见 `../../ctp-net-front/doc/md-tick-delivery.md`。
 > **怎么修、以及整条 CTP 线接下来该做什么**：`session-lifecycle.md`（会话语义、状态机 + epoch、在途对账、240 断连的消除路径、待实测清单）。
@@ -125,3 +126,24 @@ $t = Get-Content $log -Tail 250000 -Encoding UTF8
 > 注意：该日志是 **UTF-8**，`Get-Content` 默认按 ANSI/GBK 解码会让中文匹配全部落空（本次排查踩过一次）。
 
 4. 修复验收：同场景下 `等认证` 计数应为 0，且每次 `240 上限` 之后 1~2 秒内必然出现对应的 `认证/登录` 行。
+
+## 7. 2026-10-29 更新：实际改了什么、还剩什么
+
+### 已落地
+
+| 项 | 落点 | 效果 |
+|---|---|---|
+| **重连重放认证 + 登录** | `CtpSessionService.ReconnectAsync` 摘事件 → Dispose 旧 `CtpTrader` → 新建 → `LoginAsync`；而 `CtpTrader.LoginAsync` 内部顺序是「等连接 → `Authenticate` → `Login` → 结算确认」（`ctp-net-core/src/Ctp.Net.Core/Trader/CtpTrader.cs:177-196`） | §3.3 的缺陷本身不再成立：只要 `ReconnectAsync` 被触发，新连接**一定**重新认证 |
+| **重连失败不漏连接** | 同方法内新增 catch：摘事件 + `Dispose` 新建的 trader 再抛（旧版把这条从未挂到 `_trader` 的实例直接丢掉，它会继续在后台自动重连/自动重登） | 每 30s 一次的重试不再累积幽灵连接 |
+| **会话状态机 + Ready 门禁** | 新文件 `Ctp.Net.Client/CtpSessionState.cs`（`Disconnected / Connecting / Ready` + `CtpSessionNotReadyException`）；`CtpSessionService.State / Epoch / IsReady`；`GetTrader()` 改为 `RequireReady()` —— 报单、撤单、查询在非 Ready 时**直接抛异常** | §5 的 P0-3（静默黑洞）关闭：断线窗口里发单会得到 `CtpSessionNotReadyException`，调用方知道「等一下重发」 |
+| **纪元** | `Epoch` 每次进入 Ready 自增 | 上层可判断「重发时的会话与失败时是不是同一条」 |
+| **状态可见** | `State` 与 `CtpConnectionStatus` 同步切（断线 → `Connecting`，重登成功 → `Connected`） | §5 的 P0-4 的一半 |
+
+### 仍缺（都是本文件 §5 里未做的项）
+
+1. **触发条件仍依赖回调顺序**（P0-1）：`OnTraderFrontConnected` 还是 `if (_hadLoggedIn && !_socketAlive)`。§3.4 的 (a)/(b) 两种可能至今**没有客户端证据**能区分——要动它必须先补会话日志（P2），否则改错方向会引入重连风暴。
+2. **`CtpTrader.IsAuthenticated` 未提供**（P0-2）：认证状态仍只存在于 SDK 内部；本层的 Ready 是「登录 + 结算确认都成功」的等价物，够门禁用，但拿不到「认证已过、登录未过」这一中间态。
+3. **240 断连未挪安全点**（P1）：仍是攒满即断。
+4. **会话日志未恢复**（P2）：bot 的 stdout 依旧重定向到 `NUL`。
+
+> 验收口径不变：`等认证` 计数为 0，且每次 `240 上限` 后 1~2 秒内必有 `认证/登录` 行。区别是现在「没有 Ready 就发单」这件事在客户端侧就有明确异常，不再需要靠前置日志反推。
