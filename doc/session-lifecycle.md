@@ -184,7 +184,7 @@
 |---|---|---|
 | 会话状态机 + epoch | **已实现** | `src/Ctp.Net.Client/CtpSessionState.cs`（`Disconnected / Connecting / Ready` + `CtpSessionNotReadyException`）；`CtpSessionService.State / Epoch / IsReady`；`EnterReady()` 是唯一进入 Ready 的写入口 |
 | Ready 前禁止下单（显式拒绝，不静默丢） | **已实现** | `CtpSessionService.GetTrader()` → `RequireReady()`：报单/撤单/查询在非 Ready 直接抛 `CtpSessionNotReadyException`（带当时的 `State` 与 `Epoch`） |
-| `FrontConnected` 无条件重建 | **已实现（2026-10-30）** | 闸门换成「这条 trader 实例是否登过」（`_traderLoggedIn`）：登过又收到 `FrontConnected` 即重建重登，不再依赖是否先收到 `FrontDisconnected`。风暴由 `ReconnectAsync` 的单飞锁兜住；`_socketAlive` 与真实状态不一致时打一条漂移日志。见 `DESIGN.md` §10 |
+| `FrontConnected` 无条件重建 | **已实现并真机验证（2026-10-30 18:12）** | 闸门换成「这条 trader 实例是否登过」（`_traderLoggedIn`）：登过又收到 `FrontConnected` 即重建重登，不再依赖是否先收到 `FrontDisconnected`。风暴由 `ReconnectAsync` 的单飞锁兜住；`_socketAlive` 与真实状态不一致时打一条漂移日志。见 `DESIGN.md` §10 |
 | 极简会话日志 | **已做（2026-10-30）** | 启动器改带会话日志：按天 + 64MB 上限轮转；不再是 `>NUL` |
 | 在途账本 + 重连后对账 | **已实现（前置侧）** | `ctp-net-front/src/Ctp.Net.Front/FrontPendingLedger.cs` + `CtpFrontSession.ReconcilePendingAsync`：传输失败（90012-90015）才记账；下次登录重放撤单（幂等）、清理「客户端以为失败、交易所里还活着」的孤儿单 |
 | 撤单改用 `OrderSysID` | **未做（P1）** | 交易所侧撤单仍按 `(账户, OrderRef)` 定位；前置现在用「同账户重复登录踢旧会话」（`FrontSessionRegistry`）压掉 OrderRef 互踩的现实路径，但跨会话定位本身没变 |

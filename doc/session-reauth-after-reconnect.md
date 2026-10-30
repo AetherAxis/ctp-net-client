@@ -1,7 +1,7 @@
 # 断线重连后未重新认证 ⇒ 报单被前置当垃圾帧丢弃（2026-10-29 事故）
 
 > 状态：**主体已修（2026-10-29），与会话门禁相关的一半见 §7**。重连路径现在会重建 trader 并**重放认证 + 登录**，且未 Ready 的写入被显式拒绝；
-> 仍缺的是「触发条件不依赖 `Disconnected` 先到」（P0-1，见 §7）。~~240 断连的安全点化~~ 已作废——回收机制于 2026-10-30 整体删除并上线。事故当时的临时处置是让两个 bot 改走**直连交易所的旁路客户端**（见 `../../aether-ctp-hosts/doc/direct-bot-bypass.md`），旁路尚未退役。
+> ~~仍缺「触发条件不依赖 `Disconnected` 先到」~~ —— **2026-10-30 18:12 真机验证通过**（见 §7）。~~240 断连的安全点化~~ 已作废——回收机制于 2026-10-30 整体删除并上线。事故当时的临时处置是让两个 bot 改走**直连交易所的旁路客户端**（见 `../../aether-ctp-hosts/doc/direct-bot-bypass.md`），旁路尚未退役。
 > 归属：本仓 `CtpSessionService`（会话状态机）+ `ctp-net-core/CtpTrader`（认证原语）；诱因同理在 `ctp-net-front`（F0 序号 240 强制断连，**2026-10-30 已删除**）。
 > 同批困难点汇总见 `../../aether-ctp-hosts/doc/two-bots-live-market.md`；行情投递契约见 `../../ctp-net-front/doc/md-tick-delivery.md`。
 > **怎么修、以及整条 CTP 线接下来该做什么**：`session-lifecycle.md`（会话语义、状态机 + epoch、在途对账、待实测清单）。
@@ -157,9 +157,9 @@ $t = Get-Content $log -Tail 250000 -Encoding UTF8
 | **纪元** | `Epoch` 每次进入 Ready 自增 | 上层可判断「重发时的会话与失败时是不是同一条」 |
 | **状态可见** | `State` 与 `CtpConnectionStatus` 同步切（断线 → `Connecting`，重登成功 → `Connected`） | §5 的 P0-4 的一半 |
 
-### 仍缺（都是本文件 §5 里未做的项）
+### 仍缺（§5 里只剩这一条）
 
-1. ~~**触发条件仍依赖回调顺序**（P0-1）~~ —— **2026-10-30 已改（未部署）**：`OnTraderFrontConnected` 的门控从 `if (_hadLoggedIn && !_socketAlive)` 换成「这条 trader 实例登过没有」（`_traderLoggedIn`，`f0bc109`），并补了状态漂移日志——那正是 §3.4 一直缺的客户端侧证据。重连风暴由 `ReconnectAsync` 的单飞锁兜住。代码已合入（`f0bc109`），但**没在真实断连下跑过**——bot 与桌面端跑的都还不是这份构建。
+1. ~~**触发条件仍依赖回调顺序**（P0-1）~~ —— **2026-10-30 已改并真机验证通过**：`OnTraderFrontConnected` 的门控从 `if (_hadLoggedIn && !_socketAlive)` 换成「这条 trader 实例登过没有」（`_traderLoggedIn`，`f0bc109`），并补了状态漂移日志——那正是 §3.4 一直缺的客户端侧证据。重连风暴由 `ReconnectAsync` 的单飞锁兜住。**2026-10-30 18:12 已在线上验过**（console 客户端掐前置）：`前置断开 reason=4097` → `Reconnecting` → `认证响应 ErrorID=0` → `登录响应 ErrorID=0` → `结算确认 ErrorID=0` → `Connected`，前置侧同一秒出现新的 `认证/登录`（reqId 从 1 重来），窗口内 `非预期帧（等认证）= 0`。
 2. **`CtpTrader.IsAuthenticated` 未提供**（P0-2）：认证状态仍只存在于 SDK 内部；本层的 Ready 是「登录 + 结算确认都成功」的等价物，够门禁用，但拿不到「认证已过、登录未过」这一中间态。
 3. ~~**240 断连未挪安全点**（P1）：仍是攒满即断~~ —— **2026-10-30 已作废**：回收机制整体删除并上线，周期性断连这个触发源本身没了（front=`2e4867b`）。
 4. ~~**会话日志未恢复**（P2）~~ —— **2026-10-30 已恢复**：启动器改带会话日志（按天 + 64MB 轮转上限），客户端侧从此有第一手证据。
