@@ -58,6 +58,15 @@ public class CtpSessionService : ICtpSession, IDisposable
     private volatile bool _reconnecting;
     private volatile bool _disposed;
 
+    // —— 重连退避（2026-10-31，线上风暴实测）——
+    // 没有退避时「断开 → 新实例登录 → 重连即对账 → 又断」是**无节流**的紧循环：2026-10-31 09:48–10:12
+    // 单是 botmm 就打了 336 次登录（每轮 1~4 秒），期间每次断连窗口都会吞掉报单回报（看门狗判幽灵单）、
+    // 并把「实为活单」的委托当无效留下 —— 活单越积越多、每次查报单都是满额 200 行，风暴自我喂食。
+    // 现在改为指数退避：500ms / 1s / 2s / 4s / 8s / 16s / 30s（封顶）。连接稳定 <see cref="ReconnectBackoffPolicy.StableAfter"/>
+    // 之后才清零，否则「连上 1 秒又断」也会被当成健康而永远不退避。
+    private int _consecutiveReconnects;
+    private DateTime _lastReadyUtc;
+
     private sealed record MdCreds(string Front, string BrokerId, string UserId, string Password);
 
     /// <summary>
@@ -188,6 +197,7 @@ public class CtpSessionService : ICtpSession, IDisposable
         EnterReady();
         StartSafetyTimer();
         SetStatus(CtpConnectionStatus.Connected);
+        _lastReadyUtc = DateTime.UtcNow;
         return result;
     }
 
@@ -551,6 +561,24 @@ public class CtpSessionService : ICtpSession, IDisposable
         _ = Task.Run(() => ReconnectAsync());
     }
 
+    /// <summary>
+    /// 计算本次重连前要等多久，并推进连击计数（2026-10-31 风暴治理）。
+    /// <para>
+    /// 判据是「上一次 Ready 撑了多久」：≥<see cref="ReconnectBackoffPolicy.StableAfter"/> 说明连接是真的恢复了，
+    /// 连击清零、本次不等待；否则按 2^(n-1) 递增到 <see cref="ReconnectBackoffPolicy.Max"/>。
+    /// 这样正常掉线（一天几次）退避恒为 0，只有真出事时才会慢下来。
+    /// </para>
+    /// </summary>
+    private TimeSpan NextReconnectBackoff()
+    {
+        var now = DateTime.UtcNow;
+        if (_lastReadyUtc != default && ReconnectBackoffPolicy.IsReset(now - _lastReadyUtc))
+            _consecutiveReconnects = 0;
+
+        _consecutiveReconnects++;
+        return ReconnectBackoffPolicy.DelayFor(_consecutiveReconnects);
+    }
+
     /// <summary>行情前置断线：标记失活（行情不影响交易状态机，仅清 tick 缓存避免脏数据）。</summary>
     private void OnMdFrontDisconnected(object? sender, int reason)
     {
@@ -621,6 +649,15 @@ public class CtpSessionService : ICtpSession, IDisposable
             var creds = _cachedTraderCreds;
             if (creds == null) return;
 
+            // 重连退避：连不上/连上又断时按指数拉长间隔，挡掉「1~4 秒一轮」的自持风暴。
+            var backoff = NextReconnectBackoff();
+            if (backoff > TimeSpan.Zero)
+            {
+                Log($"[ctp-client] 重连退避 {backoff.TotalSeconds:0.#}s（连续第 {_consecutiveReconnects} 次重连，未稳定 {ReconnectBackoffPolicy.StableAfter.TotalSeconds:0}s 以上不清零）");
+                try { await Task.Delay(backoff); } catch { }
+                if (_disposed) return;
+            }
+
             // 旧连接已死，释放重建
             lock (_lock)
             {
@@ -677,6 +714,7 @@ public class CtpSessionService : ICtpSession, IDisposable
             await SeedOrderRefFloorAsync(trader, creds.BrokerId, creds.UserId);
             EnterReady();
             SetStatus(CtpConnectionStatus.Connected);
+            _lastReadyUtc = DateTime.UtcNow;
 
             // 重新订阅行情（若有缓存）——同样取快照（_cachedSymbols 在锁内会被改）
             MdCreds? md;
